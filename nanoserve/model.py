@@ -139,7 +139,10 @@ class GPT(nn.Module):
         if static:
             # Position comes from the device tensor, not a Python int, so the
             # embedding lookup is a kernel the graph can record.
-            x = self.wte(idx) + self.wpe(cache.pos_dev).view(1, 1, self.cfg.n_embd)
+            # view(-1, ...) rather than view(1, ...): `pos_dev` holds one position
+            # for a lockstep batch, but one *per slot* under continuous batching,
+            # where every sequence sits at a different point in its own decode.
+            x = self.wte(idx) + self.wpe(cache.pos_dev).view(-1, 1, self.cfg.n_embd)
             for block in self.h:
                 x = block(x, cache, static=True)
             cache.advance_static()
