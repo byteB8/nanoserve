@@ -62,6 +62,13 @@ class KVCache:
         self.pos_dev = torch.zeros(1, dtype=torch.long, device=device)
         self._arange = torch.arange(max_seq, device=device)
 
+        # How many positions the static path attends over. Constant within any
+        # one captured graph, but a decoder may capture several graphs at
+        # different windows and replay the smallest one that covers `pos` --
+        # otherwise a run that reserves 1024 slots pays full-window attention
+        # from its very first token.
+        self.window = max_seq
+
     # -- memory -----------------------------------------------------------
 
     def nbytes(self) -> int:
@@ -129,16 +136,16 @@ class KVCache:
         """
         self.k[layer].index_copy_(2, self.pos_dev, k)
         self.v[layer].index_copy_(2, self.pos_dev, v)
-        return self.k[layer], self.v[layer]
+        return self.k[layer][:, :, : self.window], self.v[layer][:, :, : self.window]
 
     def valid_mask(self) -> torch.Tensor:
-        """Boolean [1, 1, 1, max_seq] marking positions written so far.
+        """Boolean [1, 1, 1, window] marking positions written so far.
 
-        Attention spans the entire reserved window in static mode, so everything
-        at or before the current position is real and everything after it is
+        Attention spans the whole active window in static mode, so everything at
+        or before the current position is real and everything after it is
         uninitialised memory that must be masked out.
         """
-        return (self._arange <= self.pos_dev).view(1, 1, 1, self.max_seq)
+        return (self._arange[: self.window] <= self.pos_dev).view(1, 1, 1, self.window)
 
     def advance_static(self) -> None:
         """Advance by one token, on device, so a captured graph can do it."""
