@@ -47,6 +47,21 @@ class KVCache:
         # pass by the model, not once per layer.
         self.pos = 0
 
+        # --- static-shape decode state, for CUDA graph capture -------------
+        #
+        # A captured graph replays a fixed kernel sequence against fixed
+        # addresses, so nothing inside it may depend on a Python int that
+        # changes between steps. `pos` is exactly such an int: slicing the cache
+        # to [:pos] gives a different shape every token.
+        #
+        # The static path keeps the position in a device tensor instead. Shapes
+        # stay constant -- attention always spans the full reserved window -- and
+        # correctness comes from a mask derived from `pos_dev` on device. The
+        # graph re-reads that tensor on every replay, so incrementing it in place
+        # is enough to advance the decode.
+        self.pos_dev = torch.zeros(1, dtype=torch.long, device=device)
+        self._arange = torch.arange(max_seq, device=device)
+
     # -- memory -----------------------------------------------------------
 
     def nbytes(self) -> int:
@@ -86,8 +101,45 @@ class KVCache:
         return self.k[layer][:, :, :end], self.v[layer][:, :, :end]
 
     def advance(self, q_len: int) -> None:
-        """Commit `q_len` positions. Called once per forward pass."""
+        """Commit `q_len` positions. Called once per forward pass.
+
+        Keeps the device copy in step. A cache is routinely prefilled through the
+        ordinary path and then decoded through the static one, and if `pos_dev`
+        lagged, the first static step would write over the prompt and read the
+        wrong positional embedding.
+        """
         self.pos += q_len
+        self.pos_dev.fill_(self.pos)
 
     def reset(self) -> None:
         self.pos = 0
+        self.pos_dev.zero_()
+
+    # -- static-shape path (CUDA graph capture) ---------------------------
+
+    def append_static(
+        self, layer: int, k: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write one token's K/V at the device-held position; return whole buffers.
+
+        `index_copy_` takes the destination index as a *tensor*, so the write
+        target can change between graph replays without changing the recorded
+        kernel. Returning the full buffers rather than a [:pos] view is what keeps
+        the attention shape constant; `valid_mask` handles the correctness.
+        """
+        self.k[layer].index_copy_(2, self.pos_dev, k)
+        self.v[layer].index_copy_(2, self.pos_dev, v)
+        return self.k[layer], self.v[layer]
+
+    def valid_mask(self) -> torch.Tensor:
+        """Boolean [1, 1, 1, max_seq] marking positions written so far.
+
+        Attention spans the entire reserved window in static mode, so everything
+        at or before the current position is real and everything after it is
+        uninitialised memory that must be masked out.
+        """
+        return (self._arange <= self.pos_dev).view(1, 1, 1, self.max_seq)
+
+    def advance_static(self) -> None:
+        """Advance by one token, on device, so a captured graph can do it."""
+        self.pos_dev += 1
