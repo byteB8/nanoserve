@@ -127,3 +127,27 @@ def test_static_path_matches_eager(model, tokens):
     diff = (got - want).abs().max().item()
     assert diff < 1e-4, f"static decode diverges from eager by {diff:.2e}"
     assert int(stat.pos_dev.item()) == stat.pos + 1, "static path did not advance the position"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a CUDA device")
+def test_graphed_decode_matches_cached(model, tokens):
+    """Replaying a captured graph must produce the same tokens as eager decode.
+
+    A graph replays fixed kernels against fixed addresses. If the cache position
+    or the mask were captured as constants instead of read from device memory,
+    every step after the first would attend over the wrong window -- and would
+    still return plausible tokens. Only comparing full sequences catches that.
+    """
+    from nanoserve.generate import generate_cached, generate_graphed
+
+    gpu = model.cuda()
+    prompt = tokens.cuda()
+    n = 32
+
+    want = generate_cached(gpu, prompt, n)
+    got = generate_graphed(gpu, prompt, n)
+
+    assert torch.equal(got, want), (
+        "graphed decode diverged at token "
+        f"{int((got[0] != want[0]).nonzero()[0].item()) - prompt.size(1)}"
+    )
