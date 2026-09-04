@@ -227,6 +227,99 @@ def run_graph(model, prompt_ids, device: str, lengths: list[int], repeat: int) -
     )
 
 
+def run_serving(model, prompt_ids, device: str, slots_list: list[int], n_requests: int, seed: int = 0) -> str:
+    """Static batching against continuous batching on the same workload.
+
+    Static batching takes a group of requests, runs them in lockstep, and waits
+    for the longest before starting the next group. When output lengths vary --
+    which they always do -- every slot whose sequence finished early keeps
+    stepping until the batch drains. The wasted work is the gap between tokens
+    *asked for* and tokens *computed*.
+
+    Continuous batching returns a slot the moment its request finishes and admits
+    the next one immediately. Same model, same tokens, same hardware; the only
+    difference is who decides when a slot is free.
+
+    Lengths are drawn from a spread deliberately similar to real traffic, where a
+    short answer and a long one differ by an order of magnitude.
+    """
+    import random
+
+    from .scheduler import Request, Scheduler
+
+    rng = random.Random(seed)
+    lengths = [rng.choice([16, 24, 32, 48, 64, 96, 128, 192, 256]) for _ in range(n_requests)]
+    asked = sum(lengths)
+    prompt_len = prompt_ids.size(1)
+    max_seq = prompt_len + max(lengths)
+
+    print(f"  workload: {n_requests} requests, {asked} tokens asked, lengths {min(lengths)}-{max(lengths)}")
+    rows = []
+    for slots in slots_list:
+        # -- static: fixed groups, everyone runs to the group's longest ------
+        _sync(device)
+        t0 = time.perf_counter()
+        computed = 0
+        for i in range(0, n_requests, slots):
+            group = lengths[i : i + slots]
+            n = max(group)
+            batched = prompt_ids.repeat(len(group), 1)
+            cache = model.new_cache(batch_size=len(group), max_seq=prompt_len + n)
+            generate_cached(model, batched, n)
+            computed += len(group) * n
+            del cache
+            if device == "cuda":
+                torch.cuda.empty_cache()
+        _sync(device)
+        static_s = time.perf_counter() - t0
+
+        # -- continuous: refill a slot as soon as it frees -------------------
+        sched = Scheduler(model, n_slots=slots, max_seq=max_seq)
+        for n in lengths:
+            sched.submit(Request(prompt=prompt_ids, max_tokens=n))
+        _sync(device)
+        t0 = time.perf_counter()
+        sched.run_to_completion()
+        _sync(device)
+        cont_s = time.perf_counter() - t0
+        cont_computed = sched.steps * slots
+
+        rows.append(
+            [
+                str(slots),
+                f"{static_s:.2f}",
+                f"{cont_s:.2f}",
+                f"**{static_s / cont_s:.2f}x**",
+                f"{asked / static_s:.0f}",
+                f"{asked / cont_s:.0f}",
+                f"{computed / asked:.2f}x",
+                f"{cont_computed / asked:.2f}x",
+            ]
+        )
+        print(
+            f"  slots {slots:3d}: static {static_s:6.2f}s ({asked/static_s:7.0f} tok/s, "
+            f"{computed/asked:.2f}x work)   continuous {cont_s:6.2f}s "
+            f"({asked/cont_s:7.0f} tok/s, {cont_computed/asked:.2f}x work)   -> {static_s/cont_s:.2f}x"
+        )
+        del sched
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    return _table(
+        [
+            "Slots",
+            "Static (s)",
+            "Continuous (s)",
+            "Speedup",
+            "Static tok/s",
+            "Continuous tok/s",
+            "Static work",
+            "Continuous work",
+        ],
+        rows,
+    )
+
+
 def run_kvquant(model, prompt_ids, device: str, batches: list[int], n_tokens: int, repeat: int) -> str:
     """fp KV against int8 KV: stored bytes, measured peak, speed, and agreement.
 
@@ -382,7 +475,7 @@ def run_memory(model_name: str, batches: list[int], contexts: list[int], dtype_b
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("experiment", choices=["kvcache", "batch", "memory", "dtype", "graph", "kvquant", "all"])
+    p.add_argument("experiment", choices=["kvcache", "batch", "memory", "dtype", "graph", "kvquant", "serving", "all"])
     p.add_argument("--model", default="gpt2", choices=sorted(PRESETS))
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     p.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
@@ -392,6 +485,7 @@ def main() -> None:
     p.add_argument("--contexts", type=int, nargs="+", default=[256, 512, 1024])
     p.add_argument("--dtypes", nargs="+", default=["float32", "float16"], help="precisions to compare in the dtype experiment")
     p.add_argument("--kv-dtype", dest="kv_dtype", default="auto", choices=["auto", "int8"], help="KV cache storage precision")
+    p.add_argument("--requests", type=int, default=64, help="requests in the serving workload")
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--threads", type=int, default=None, help="torch CPU threads")
     p.add_argument("--out", default=None, help="write markdown here instead of stdout")
@@ -406,9 +500,9 @@ def main() -> None:
     dtype_bytes = torch.empty(0, dtype=dtype).element_size()
 
     sections = [f"_Generated by `nanoserve.bench {args.experiment}`._\n"]
-    want = ["kvcache", "batch", "graph", "dtype", "kvquant", "memory"] if args.experiment == "all" else [args.experiment]
+    want = ["kvcache", "batch", "graph", "dtype", "kvquant", "serving", "memory"] if args.experiment == "all" else [args.experiment]
 
-    needs_model = any(w in ("kvcache", "batch", "graph", "kvquant") for w in want)
+    needs_model = any(w in ("kvcache", "batch", "graph", "kvquant", "serving") for w in want)
     if needs_model:
         print(f"Loading {args.model} on {args.device} ({args.dtype}) ...")
         model = load_pretrained(args.model, dtype=dtype).to(args.device)
@@ -431,6 +525,9 @@ def main() -> None:
         elif w == "graph":
             print("\nCUDA graph vs eager decode")
             sections.append("## CUDA graph vs eager decode\n\n" + run_graph(model, prompt_ids, args.device, args.lengths, args.repeat))
+        elif w == "serving":
+            print("\nStatic vs continuous batching")
+            sections.append("## Static vs continuous batching\n\n" + run_serving(model, prompt_ids, args.device, args.batches, args.requests))
         elif w == "kvquant":
             print("\nINT8 KV cache")
             sections.append("## INT8 KV cache\n\n" + run_kvquant(model, prompt_ids, args.device, args.batches, args.tokens, args.repeat))
