@@ -84,7 +84,7 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
 # -- experiments ----------------------------------------------------------
 
 
-def run_kvcache(model, prompt_ids, device: str, lengths: list[int], repeat: int) -> str:
+def run_kvcache(model, prompt_ids, device: str, lengths: list[int], repeat: int, kv_dtype: str = "auto") -> str:
     rows = []
     prompt_len = prompt_ids.size(1)
     budget = model.cfg.block_size - prompt_len
@@ -96,7 +96,7 @@ def run_kvcache(model, prompt_ids, device: str, lengths: list[int], repeat: int)
         # Hoist cache allocation out of the timed region. Otherwise the cached
         # path is charged a multi-MiB memset that the naive path never pays,
         # which at short lengths is large enough to invert the comparison.
-        cache = model.new_cache(batch_size=prompt_ids.size(0), max_seq=prompt_len + n)
+        cache = model.new_cache(batch_size=prompt_ids.size(0), max_seq=prompt_len + n, kv_dtype=kv_dtype)
         naive = _time(lambda: generate_naive(model, prompt_ids, n), device, repeat=repeat)
         cached = _time(lambda: generate_cached(model, prompt_ids, n, cache=cache), device, repeat=repeat)
         rows.append(
@@ -116,7 +116,7 @@ def run_kvcache(model, prompt_ids, device: str, lengths: list[int], repeat: int)
     )
 
 
-def run_batch(model, prompt_ids, device: str, batches: list[int], n_tokens: int, repeat: int) -> str:
+def run_batch(model, prompt_ids, device: str, batches: list[int], n_tokens: int, repeat: int, kv_dtype: str = "auto") -> str:
     rows = []
     single = None
     for b in batches:
@@ -125,7 +125,7 @@ def run_batch(model, prompt_ids, device: str, batches: list[int], n_tokens: int,
             # Allocated outside the timed region, as in run_kvcache: cache setup
             # scales with batch, so timing it here would confound the throughput
             # curve with allocator behaviour.
-            cache = model.new_cache(batch_size=b, max_seq=prompt_ids.size(1) + n_tokens)
+            cache = model.new_cache(batch_size=b, max_seq=prompt_ids.size(1) + n_tokens, kv_dtype=kv_dtype)
             if device == "cuda":
                 torch.cuda.reset_peak_memory_stats()
             secs = _time(lambda: generate_cached(model, batched, n_tokens, cache=cache), device, repeat=repeat)
@@ -227,6 +227,64 @@ def run_graph(model, prompt_ids, device: str, lengths: list[int], repeat: int) -
     )
 
 
+def run_kvquant(model, prompt_ids, device: str, batches: list[int], n_tokens: int, repeat: int) -> str:
+    """fp KV against int8 KV: stored bytes, measured peak, speed, and agreement.
+
+    Storage drops ~3.8x (4x from int8, less one fp scale per token per head).
+    Measured peak drops by less, because attention still runs in floating point:
+    the layer being processed holds a dequantised copy of its window. That gap
+    between stored and peak is the honest cost of dequantise-on-read, and it is
+    why the concurrency gain is not the 4x the storage figure suggests.
+    """
+    prompt_len = prompt_ids.size(1)
+    rows = []
+    ref = None
+    for kv in ("auto", "int8"):
+        for b in batches:
+            batched = prompt_ids.repeat(b, 1)
+            try:
+                cache = model.new_cache(batch_size=b, max_seq=prompt_len + n_tokens, kv_dtype=kv)
+                if device == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
+                secs = _time(lambda: generate_cached(model, batched, n_tokens, cache=cache), device, repeat=repeat)
+                peak = torch.cuda.max_memory_allocated() / 2**20 if device == "cuda" else 0.0
+                out = generate_cached(model, batched, n_tokens, cache=cache)[0, prompt_len:]
+            except (torch.cuda.OutOfMemoryError if device == "cuda" else RuntimeError):
+                print(f"  {kv:5s} batch {b:5d}: OOM")
+                rows.append([kv, str(b), "-", "**OOM**", "-", "-"])
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+                continue
+
+            if ref is None:
+                ref, agree = out, "reference"
+            else:
+                same = out == ref
+                agree = f"{int(same.sum())}/{n_tokens}"
+
+            rows.append(
+                [
+                    kv,
+                    str(b),
+                    f"{cache.nbytes() / 2**20:.0f}",
+                    f"{peak:.0f}" if peak else "-",
+                    f"{secs / n_tokens * 1000:.2f}",
+                    agree,
+                ]
+            )
+            print(
+                f"  {kv:5s} batch {b:5d}: stored {cache.nbytes()/2**20:7.0f} MiB  "
+                f"peak {peak:8.0f} MiB  {secs/n_tokens*1000:6.2f} ms/tok  agree {agree}"
+            )
+            del cache
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+    return _table(
+        ["KV store", "Batch", "Stored (MiB)", "Peak VRAM (MiB)", "ms/token", "Agreement"], rows
+    )
+
+
 def run_dtype(model_name: str, device: str, dtypes: list[str], n_tokens: int, repeat: int) -> str:
     """Precision trade-off: what half precision buys, and what it costs.
 
@@ -324,7 +382,7 @@ def run_memory(model_name: str, batches: list[int], contexts: list[int], dtype_b
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("experiment", choices=["kvcache", "batch", "memory", "dtype", "graph", "all"])
+    p.add_argument("experiment", choices=["kvcache", "batch", "memory", "dtype", "graph", "kvquant", "all"])
     p.add_argument("--model", default="gpt2", choices=sorted(PRESETS))
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     p.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
@@ -333,6 +391,7 @@ def main() -> None:
     p.add_argument("--tokens", type=int, default=128, help="tokens to generate in the batch sweep")
     p.add_argument("--contexts", type=int, nargs="+", default=[256, 512, 1024])
     p.add_argument("--dtypes", nargs="+", default=["float32", "float16"], help="precisions to compare in the dtype experiment")
+    p.add_argument("--kv-dtype", dest="kv_dtype", default="auto", choices=["auto", "int8"], help="KV cache storage precision")
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--threads", type=int, default=None, help="torch CPU threads")
     p.add_argument("--out", default=None, help="write markdown here instead of stdout")
@@ -347,9 +406,9 @@ def main() -> None:
     dtype_bytes = torch.empty(0, dtype=dtype).element_size()
 
     sections = [f"_Generated by `nanoserve.bench {args.experiment}`._\n"]
-    want = ["kvcache", "batch", "graph", "dtype", "memory"] if args.experiment == "all" else [args.experiment]
+    want = ["kvcache", "batch", "graph", "dtype", "kvquant", "memory"] if args.experiment == "all" else [args.experiment]
 
-    needs_model = any(w in ("kvcache", "batch", "graph") for w in want)
+    needs_model = any(w in ("kvcache", "batch", "graph", "kvquant") for w in want)
     if needs_model:
         print(f"Loading {args.model} on {args.device} ({args.dtype}) ...")
         model = load_pretrained(args.model, dtype=dtype).to(args.device)
@@ -365,13 +424,16 @@ def main() -> None:
     for w in want:
         if w == "kvcache":
             print("\nKV-cache: naive vs cached decode")
-            sections.append("## KV-cache: naive vs cached decode\n\n" + run_kvcache(model, prompt_ids, args.device, args.lengths, args.repeat))
+            sections.append("## KV-cache: naive vs cached decode\n\n" + run_kvcache(model, prompt_ids, args.device, args.lengths, args.repeat, args.kv_dtype))
         elif w == "batch":
             print("\nBatch scaling (cached decode)")
-            sections.append("## Batch scaling\n\n" + run_batch(model, prompt_ids, args.device, args.batches, args.tokens, args.repeat))
+            sections.append("## Batch scaling\n\n" + run_batch(model, prompt_ids, args.device, args.batches, args.tokens, args.repeat, args.kv_dtype))
         elif w == "graph":
             print("\nCUDA graph vs eager decode")
             sections.append("## CUDA graph vs eager decode\n\n" + run_graph(model, prompt_ids, args.device, args.lengths, args.repeat))
+        elif w == "kvquant":
+            print("\nINT8 KV cache")
+            sections.append("## INT8 KV cache\n\n" + run_kvquant(model, prompt_ids, args.device, args.batches, args.tokens, args.repeat))
         elif w == "dtype":
             print("\nPrecision trade-off")
             sections.append("## Precision trade-off\n\n" + run_dtype(args.model, args.device, args.dtypes, args.tokens, args.repeat))
