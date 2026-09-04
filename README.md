@@ -4,11 +4,23 @@ A GPT-2 inference engine written from scratch, built to measure one thing precis
 
 No `transformers.generate()`. The model definition, the attention maths, the cache and the decode loop are all local code — because the interesting engineering in LLM serving lives in exactly the parts a library hides.
 
+![streaming demo](docs/demo.gif)
+
+*Real capture, played back at 1x — those pauses are the model's actual per-token latency on a laptop CPU. Regenerate with `python scripts/make_demo.py`.*
+
 ```bash
 pip install -r requirements.txt
 pytest                                          # prove it matches real GPT-2
 python -m nanoserve.bench kvcache --device cpu  # measure the speedup
+uvicorn nanoserve.server:app --port 8000        # serve it
 ```
+
+```bash
+curl -N localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"A KV cache works by"}],"stream":true}'
+```
+
+The endpoint is OpenAI-wire-compatible, so the `openai` SDK and any chat UI can point at it unmodified. It is **not hosted anywhere** — clone and run it. Two limits are worth stating plainly: GPT-2 is a base model with no chat template, so the chat schema is accepted but the model completes text rather than converses; and requests are serialised one at a time, which is exactly what continuous batching would fix.
 
 ## The question
 
@@ -25,7 +37,10 @@ That is the textbook claim. This repo measures it, then asks the follow-up quest
 | `nanoserve/generate.py` | Two decode loops: `generate_naive` (no cache) and `generate_cached` |
 | `nanoserve/weights.py` | Ports pretrained GPT-2 weights, shape-checking every tensor |
 | `nanoserve/bench.py` | Benchmark harness; emits markdown straight into `RESULTS.md` |
-| `tests/test_parity.py` | Correctness gates (see below) |
+| `nanoserve/quant.py` | INT8 KV store, per-token symmetric scales |
+| `nanoserve/graph.py` | Bucketed CUDA graph capture of the decode step |
+| `nanoserve/server.py` | OpenAI-compatible HTTP endpoint with SSE streaming |
+| `tests/` | Correctness gates (see below) |
 
 ## Correctness first
 
@@ -80,9 +95,9 @@ cp scripts/remote.env.example scripts/remote.env   # fill in host details (gitig
 - [x] GPU numbers: batch saturation curve, VRAM-limited OOM boundary
 - [x] Precision study: fp32 / fp16 / bf16 — memory, speed, and token agreement
 - [x] CUDA graphs, bucketed by attention window — 2.3x faster decode
-- [ ] INT8 KV-cache quantisation — memory saved vs quality lost
+- [x] INT8 KV cache — 2.5x the concurrency, exact token agreement
+- [x] Streaming OpenAI-compatible HTTP endpoint
 - [ ] Continuous batching: admit new sequences mid-flight instead of padding to the longest
-- [ ] Streaming HTTP endpoint
 
 ## License
 
