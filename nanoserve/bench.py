@@ -153,6 +153,13 @@ def run_batch(model, prompt_ids, device: str, batches: list[int], n_tokens: int,
             f"  batch {b:4d}: {secs:6.2f}s  total {total_tps:8.1f} tok/s  "
             f"per-seq {n_tokens/secs:6.1f} tok/s  kv {kv_mib:6.0f} MiB  peak {peak:7.0f} MiB"
         )
+        # Release this step's cache before sizing the next one. Without it the
+        # allocator still holds the previous (smaller) reservation when the next
+        # allocation is attempted, and the sweep reports an OOM that the model
+        # would not hit on its own -- a measurement artifact, not a real limit.
+        del cache
+        if device == "cuda":
+            torch.cuda.empty_cache()
     return _table(
         [
             "Batch",
