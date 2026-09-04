@@ -8,6 +8,8 @@ Two claims need to hold before any benchmark number means anything:
 If (2) fails, the speedup is just the cost of being wrong faster.
 """
 
+import copy
+
 import pytest
 import torch
 
@@ -140,7 +142,10 @@ def test_graphed_decode_matches_cached(model, tokens):
     """
     from nanoserve.generate import generate_cached, generate_graphed
 
-    gpu = model.cuda()
+    # deepcopy, not model.cuda(): nn.Module.cuda() mutates in place, and this
+    # fixture is module-scoped. Moving it would strand every later test on a
+    # different device from its inputs.
+    gpu = copy.deepcopy(model).cuda()
     prompt = tokens.cuda()
     n = 32
 
