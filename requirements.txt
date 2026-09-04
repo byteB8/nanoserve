@@ -1,0 +1,10 @@
+# Minimum floors rather than pins: the point is to run on whatever the GPU box
+# already has. On a CUDA machine install torch from the index matching its driver
+# (https://pytorch.org/get-started/locally/) before installing this file.
+torch>=2.4
+transformers>=4.40
+safetensors>=0.4
+numpy>=1.26
+
+# tests only
+pytest>=8.0
