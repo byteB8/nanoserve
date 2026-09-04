@@ -67,8 +67,17 @@ case "${1:-}" in
   setup)
     push
     echo ">> creating remote venv and installing dependencies"
+    # pip's default index serves a torch built against the newest CUDA, which a
+    # box running an older driver cannot load -- it installs cleanly and then
+    # reports no GPU. Install torch from a driver-matched index first so the
+    # requirements pass finds it already satisfied.
+    torch_step=""
+    if [[ -n "${REMOTE_TORCH_INDEX:-}" ]]; then
+      torch_step=".venv/bin/pip install -q torch --index-url ${REMOTE_TORCH_INDEX} && "
+    fi
     "${SSH[@]}" "$(prelude) cd ${REMOTE_DIR} && ${REMOTE_PYTHON} -m venv .venv && \
       .venv/bin/pip install -q --upgrade pip && \
+      ${torch_step} \
       .venv/bin/pip install -q -r requirements.txt && \
       .venv/bin/python -c 'import torch; print(\"torch\", torch.__version__, \"| cuda\", torch.cuda.is_available(), \"|\", torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"cpu only\")'"
     ;;
