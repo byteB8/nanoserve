@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Server details stay out of a public repo.
+scripts/remote.env
+
+# Benchmark output is regenerated; only curated results are committed.
+results/*.md
+!results/.gitkeep
+
+.DS_Store
+.vscode/
+.idea/
