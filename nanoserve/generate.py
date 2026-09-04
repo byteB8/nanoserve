@@ -95,3 +95,48 @@ def generate_cached(
         out.append(token)
 
     return torch.cat(out, dim=1)
+
+
+@torch.no_grad()
+def generate_graphed(
+    model: GPT,
+    idx: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    generator=None,
+    cache=None,
+    decoder=None,
+) -> torch.Tensor:
+    """Same as `generate_cached`, with the decode step replayed from a CUDA graph.
+
+    Prefill still runs eagerly: it happens once, its shape depends on the prompt,
+    and capturing a graph per prompt length would cost more than it saves. Only
+    the decode loop -- the part executed hundreds of times at a fixed shape -- is
+    captured.
+
+    Pass a `decoder` to reuse a capture across calls. Capturing takes a few
+    hundred milliseconds, so a benchmark that captures inside its timed region is
+    measuring the wrong thing.
+    """
+    from .graph import GraphedDecoder
+
+    batch, prompt_len = idx.shape
+    if cache is None:
+        cache = model.new_cache(batch_size=batch, max_seq=prompt_len + max_new_tokens)
+    else:
+        cache.reset()
+
+    logits = model(idx, cache, last_only=True)
+    token = _next_token(logits, temperature, top_p, generator)
+    out = [idx, token]
+
+    if decoder is None:
+        decoder = GraphedDecoder(model, cache, batch_size=batch)
+
+    for _ in range(max_new_tokens - 1):
+        logits = decoder.step(token)
+        token = _next_token(logits, temperature, top_p, generator)
+        out.append(token)
+
+    return torch.cat(out, dim=1)
