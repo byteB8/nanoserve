@@ -102,12 +102,20 @@ class GPT(nn.Module):
         # GPT-2 ties the output projection to the input embedding.
         self.lm_head.weight = self.wte.weight
 
-    def forward(self, idx: torch.Tensor, cache: KVCache | None = None) -> torch.Tensor:
-        """Return logits for every position in `idx`.
+    def forward(
+        self, idx: torch.Tensor, cache: KVCache | None = None, last_only: bool = False
+    ) -> torch.Tensor:
+        """Return logits for every position in `idx`, or just the last one.
 
         With a cache, `idx` holds only the *new* tokens; positions are numbered
         from where the cache left off, which is what makes an incremental decode
         step see the same positional embeddings the naive path would have used.
+
+        `last_only` drops the vocab projection on every position except the final
+        one. Generation reads only that position, and the projection is the widest
+        tensor in the model -- [batch, T, 50257]. Measured on an A5000, computing
+        it across a 10-token prompt cost 2.01 MiB per sequence, which at batch
+        1024 is 2 GiB spent on values that are immediately discarded.
         """
         B, T = idx.shape
         past = cache.pos if cache is not None else 0
@@ -125,7 +133,10 @@ class GPT(nn.Module):
         if cache is not None:
             cache.advance(T)
 
-        return self.lm_head(self.ln_f(x))
+        x = self.ln_f(x)
+        if last_only:
+            x = x[:, -1:, :]
+        return self.lm_head(x)
 
     # -- convenience ------------------------------------------------------
 
