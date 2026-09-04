@@ -66,10 +66,20 @@ def generate_cached(
     temperature: float = 0.0,
     top_p: float = 1.0,
     generator=None,
+    cache=None,
 ) -> torch.Tensor:
-    """Prefill the prompt once, then advance one token at a time through the cache."""
+    """Prefill the prompt once, then advance one token at a time through the cache.
+
+    Pass an existing `cache` to reuse its storage. Allocating and zeroing a cache
+    is not free -- tens of MiB of memset at long context -- and a server does it
+    once per slot, not once per request. Benchmarks should hoist it out of the
+    timed region or they attribute setup cost to the decode algorithm.
+    """
     batch, prompt_len = idx.shape
-    cache = model.new_cache(batch_size=batch, max_seq=prompt_len + max_new_tokens)
+    if cache is None:
+        cache = model.new_cache(batch_size=batch, max_seq=prompt_len + max_new_tokens)
+    else:
+        cache.reset()
 
     # Prefill: the whole prompt in a single pass. This is the compute-bound
     # phase -- one big matmul per layer, high arithmetic intensity.
