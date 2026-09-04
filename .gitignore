@@ -6,7 +6,7 @@ venv/
 .pytest_cache/
 
 # Server details stay out of a public repo.
-scripts/remote.env
+scripts/remote*.env
 
 # Benchmark output is regenerated; only curated results are committed.
 results/*.md
