@@ -29,17 +29,37 @@ from .cache import KVCache
 from .model import GPT
 
 
-class GraphedDecoder:
-    """A captured single-token decode step, replayable at a fixed batch size.
+DEFAULT_BUCKETS = (128, 256, 512, 1024)
 
-    Usage mirrors a forward pass, except the caller must accept that the returned
-    logits live in a buffer that the next `step` overwrites::
+
+class GraphedDecoder:
+    """Captured single-token decode steps, bucketed by attention window.
+
+    A single full-window graph removes launch overhead but replaces it with a new
+    cost: attention over every reserved slot on every step, including the ones a
+    short sequence never reaches. Measured on an A5000, that turned a 2.29x win at
+    64 tokens into 1.11x at 1000 -- the launch saving is constant, the wasted
+    attention grows with the reservation.
+
+    So capture several graphs at increasing windows and replay the smallest one
+    that covers the current position. Each graph is still fixed-shape, which is
+    all capture requires; the choice between them is an ordinary Python branch
+    outside any graph.
+
+    Logits live in a per-bucket buffer that the next `step` overwrites::
 
         decoder = GraphedDecoder(model, cache, batch_size)
         logits = decoder.step(token)      # valid until the next step()
     """
 
-    def __init__(self, model: GPT, cache: KVCache, batch_size: int, warmup: int = 3) -> None:
+    def __init__(
+        self,
+        model: GPT,
+        cache: KVCache,
+        batch_size: int,
+        buckets: tuple[int, ...] | None = None,
+        warmup: int = 3,
+    ) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA graphs require a CUDA device")
         if cache.batch_size != batch_size:
@@ -49,14 +69,22 @@ class GraphedDecoder:
         self.cache = cache
         self.batch_size = batch_size
 
-        device = cache.device
-        self.token = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+        chosen = sorted({min(b, cache.max_seq) for b in (buckets or DEFAULT_BUCKETS)})
+        self.buckets = [b for b in chosen if b <= cache.max_seq] or [cache.max_seq]
+        if self.buckets[-1] < cache.max_seq:
+            self.buckets.append(cache.max_seq)
 
-        # Warm up on a side stream first. Capture records whatever kernels run,
-        # so any one-off initialisation -- cuBLAS handles, autotuning, lazy module
-        # setup -- must happen before capture or it gets baked into the graph.
-        # Warmup also advances the cache, so the position is restored afterwards.
+        self.token = torch.zeros(batch_size, 1, dtype=torch.long, device=cache.device)
+        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.outputs: dict[int, torch.Tensor] = {}
+
         saved_pos = int(cache.pos_dev.item())
+        saved_window = cache.window
+
+        # Warm up once, on a side stream, before any capture. Capture records
+        # whatever kernels run, so one-off initialisation -- cuBLAS handles,
+        # autotuning, lazy module setup -- must be flushed out beforehand or it
+        # gets baked into the first graph.
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream), torch.no_grad():
@@ -65,17 +93,42 @@ class GraphedDecoder:
                 model(self.token, cache, static=True)
         torch.cuda.current_stream().wait_stream(stream)
 
-        cache.pos_dev.fill_(saved_pos)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph), torch.no_grad():
-            self.logits = model(self.token, cache, static=True)
+        # One graph per bucket. They share the same weights and the same cache
+        # storage; only the attention window differs.
+        pool = None
+        for window in self.buckets:
+            cache.window = window
+            cache.pos_dev.fill_(min(saved_pos, window - 1))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool), torch.no_grad():
+                self.outputs[window] = model(self.token, cache, static=True)
+            pool = graph.pool()  # share one memory pool across buckets
+            self.graphs[window] = graph
 
-        # Capture itself ran the step once and advanced the position; undo that
-        # so the caller starts from where they left off.
+        cache.window = saved_window
         cache.pos_dev.fill_(saved_pos)
+
+        # Host-side mirror of the decode position. Reading `pos_dev` would mean a
+        # device-to-host sync on every token, stalling the pipeline for exactly
+        # the overhead the graph exists to remove. The position advances by one
+        # per step and by nothing else, so it can be tracked here and reconciled
+        # once per generation via `sync()`.
+        self._pos = saved_pos
+
+    def sync(self) -> None:
+        """Re-read the device position. Call once after a prefill, not per token."""
+        self._pos = int(self.cache.pos_dev.item())
+
+    def _bucket_for(self, pos: int) -> int:
+        for b in self.buckets:
+            if pos < b:
+                return b
+        return self.buckets[-1]
 
     def step(self, token: torch.Tensor) -> torch.Tensor:
         """Decode one token. Returns logits [batch, 1, vocab] valid until next call."""
+        window = self._bucket_for(self._pos)
         self.token.copy_(token)
-        self.graph.replay()
-        return self.logits
+        self.graphs[window].replay()
+        self._pos += 1
+        return self.outputs[window]

@@ -133,6 +133,8 @@ def generate_graphed(
 
     if decoder is None:
         decoder = GraphedDecoder(model, cache, batch_size=batch)
+    else:
+        decoder.sync()  # one device read per generation, not per token
 
     for _ in range(max_new_tokens - 1):
         logits = decoder.step(token)
