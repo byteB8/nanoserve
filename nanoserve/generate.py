@@ -98,6 +98,45 @@ def generate_cached(
 
 
 @torch.no_grad()
+def stream_cached(
+    model: GPT,
+    idx: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    generator=None,
+    cache=None,
+    stop_ids: set[int] | None = None,
+):
+    """Yield token ids one at a time, as they are produced.
+
+    Same decode loop as `generate_cached`, surfaced as a generator so a server can
+    flush each token to the client instead of waiting for the whole completion.
+    Kept separate rather than refactoring `generate_cached` into it: that function
+    is what every benchmark in RESULTS.md timed, and wrapping its inner loop in
+    generator machinery would quietly change the numbers.
+    """
+    batch, prompt_len = idx.shape
+    if batch != 1:
+        raise ValueError("streaming is single-sequence; batch decoding goes through generate_cached")
+    if cache is None:
+        cache = model.new_cache(batch_size=1, max_seq=prompt_len + max_new_tokens)
+    else:
+        cache.reset()
+
+    logits = model(idx, cache, last_only=True)
+    token = _next_token(logits, temperature, top_p, generator)
+
+    for _ in range(max_new_tokens):
+        tid = int(token.item())
+        if stop_ids and tid in stop_ids:
+            return
+        yield tid
+        logits = model(token, cache, last_only=True)
+        token = _next_token(logits, temperature, top_p, generator)
+
+
+@torch.no_grad()
 def generate_graphed(
     model: GPT,
     idx: torch.Tensor,
