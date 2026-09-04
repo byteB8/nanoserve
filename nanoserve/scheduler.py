@@ -21,6 +21,7 @@ Two pieces:
 
 from __future__ import annotations
 
+import heapq
 import itertools
 from dataclasses import dataclass, field
 
@@ -122,8 +123,23 @@ class SlotCache:
         self.v = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(cfg.n_layer)]
 
         # One position per slot. This is the whole difference from KVCache.
-        self.pos_dev = torch.zeros(n_slots, dtype=torch.long, device=device)
+        self.positions = torch.zeros(n_slots, dtype=torch.long, device=device)
         self._arange = torch.arange(max_seq, device=device)
+
+        # How many leading slots take part in a step. Idle slots still cost a
+        # full column of attention and MLP, so the scheduler packs live requests
+        # into low slot indices and steps only the prefix that holds them.
+        self.n_active = n_slots
+
+    @property
+    def pos_dev(self) -> torch.Tensor:
+        """The positions the model should see: only the active prefix.
+
+        The model reads this directly, so it has to be the sliced view. Handing
+        it the full vector while passing a sliced input tensor silently broadcasts
+        the batch back up to every slot.
+        """
+        return self.positions[: self.n_active]
 
     def nbytes(self) -> int:
         elems = self.n_slots * self.cfg.n_head * self.max_seq * self.cfg.head_dim
@@ -142,24 +158,25 @@ class SlotCache:
         its own offset in one kernel.
         """
         b, h, _, d = k.shape
-        idx = self.pos_dev.view(b, 1, 1, 1).expand(b, h, 1, d)
-        self.k[layer].scatter_(2, idx, k)
-        self.v[layer].scatter_(2, idx, v)
+        idx = self.positions[:b].view(b, 1, 1, 1).expand(b, h, 1, d)
+        self.k[layer][:b].scatter_(2, idx, k)
+        self.v[layer][:b].scatter_(2, idx, v)
         w = self.window
-        return self.k[layer][:, :, :w], self.v[layer][:, :, :w]
+        return self.k[layer][:b, :, :w], self.v[layer][:b, :, :w]
 
     def valid_mask(self) -> torch.Tensor:
-        """[slots, 1, 1, window] -- each slot sees only its own written positions."""
-        return (self._arange[: self.window].unsqueeze(0) <= self.pos_dev.unsqueeze(1)).view(
-            self.n_slots, 1, 1, self.window
+        """[active, 1, 1, window] -- each slot sees only its own written positions."""
+        n = self.n_active
+        return (self._arange[: self.window].unsqueeze(0) <= self.positions[:n].unsqueeze(1)).view(
+            n, 1, 1, self.window
         )
 
     def advance_static(self) -> None:
-        self.pos_dev += 1
+        self.positions[: self.n_active] += 1
 
     def release(self, slot: int) -> None:
         """Return a slot to the pool. Stale KV is harmless: the mask hides it."""
-        self.pos_dev[slot] = 0
+        self.positions[slot] = 0
 
 
 class Scheduler:
@@ -179,13 +196,24 @@ class Scheduler:
         self.history: list[torch.Tensor] = []
         p = next(model.parameters())
         self.cache = SlotCache(model.cfg, n_slots, max_seq, device=p.device, dtype=p.dtype)
+        # A heap, not a queue: always reusing the lowest free slot keeps live
+        # requests packed into a contiguous prefix, which is what makes slicing
+        # the batch worthwhile.
         self.free: list[int] = list(range(n_slots))
+        heapq.heapify(self.free)
         self.active: dict[int, Request] = {}
         self.waiting: list[Request] = []
         self.finished: list[Request] = []
         # Token most recently produced by each slot; the input to the next step.
         self.last = torch.zeros(n_slots, 1, dtype=torch.long, device=p.device)
         self.steps = 0
+        # Attention window buckets. The static decode path spans `cache.window`
+        # regardless of how far any sequence has actually got, so a pool reserved
+        # for 1024 tokens would pay full-window attention from its first step --
+        # the same trap the CUDA graph work hit in RESULTS.md §6. Every position
+        # is known host-side, so the window can be widened only as sequences
+        # actually grow, in coarse steps to avoid reshaping every token.
+        self.buckets = [b for b in (64, 128, 256, 512, 1024) if b < max_seq] + [max_seq]
 
     # -- admission --------------------------------------------------------
 
@@ -198,14 +226,14 @@ class Scheduler:
         admitted = 0
         while self.free and self.waiting:
             req = self.waiting.pop(0)
-            slot = self.free.pop(0)
+            slot = heapq.heappop(self.free)
             req.slot, req.started = slot, now
 
             view = self.cache.view(slot)
             logits = self.model(req.prompt, view, last_only=True)
             token = _next_token(logits, req.temperature, req.top_p, None)
 
-            self.cache.pos_dev[slot] = view.pos
+            self.cache.positions[slot] = view.pos
             self.last[slot] = token
             req.first = int(token.item())  # one sync, at admission only
             req.n = 1
@@ -222,11 +250,11 @@ class Scheduler:
             # Collect this slot's column from the step history in a single
             # transfer, rather than one per token as it was produced.
             steps = self.history[req.start_step : req.start_step + req.n - 1]
-            rest = torch.cat([h[slot] for h in steps]).tolist() if steps else []
+            rest = torch.cat([h[slot] for _, h in steps]).tolist() if steps else []
             req.tokens = [req.first] + rest
             self.finished.append(req)
             self.cache.release(slot)
-            self.free.append(slot)
+            heapq.heappush(self.free, slot)
         return len(done)
 
     # -- the loop ---------------------------------------------------------
@@ -245,14 +273,21 @@ class Scheduler:
         if not self.active:
             return 0
 
-        logits = self.model(self.last, self.cache, static=True)
+        # Widen the window to cover the furthest-advanced slot, and no further.
+        need = max(r.prompt.size(1) + r.n for r in self.active.values()) + 1
+        self.cache.window = next(b for b in self.buckets if b >= need)
+
+        # Step only the prefix that actually holds live requests.
+        n = max(self.active) + 1
+        self.cache.n_active = n
+        logits = self.model(self.last[:n], self.cache, static=True)
 
         # One sampler call for the whole batch, and no `.item()` anywhere: reading
         # a token back per slot per step means a device-to-host sync per slot per
         # step, which at 128 slots costs far more than the decode it is reporting.
         tokens = _next_token(logits, self.temperature, self.top_p, None)
-        self.last.copy_(tokens)
-        self.history.append(tokens)
+        self.last[:n].copy_(tokens)
+        self.history.append((n, tokens))
         for req in self.active.values():
             req.n += 1
 
