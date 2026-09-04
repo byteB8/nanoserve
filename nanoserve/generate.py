@@ -53,7 +53,7 @@ def generate_naive(
     """Regenerate from the full sequence every step. No cache, quadratic work."""
     for _ in range(max_new_tokens):
         window = idx[:, -model.cfg.block_size :]
-        logits = model(window)
+        logits = model(window, last_only=True)
         idx = torch.cat([idx, _next_token(logits, temperature, top_p, generator)], dim=1)
     return idx
 
@@ -83,14 +83,14 @@ def generate_cached(
 
     # Prefill: the whole prompt in a single pass. This is the compute-bound
     # phase -- one big matmul per layer, high arithmetic intensity.
-    logits = model(idx, cache)
+    logits = model(idx, cache, last_only=True)
     token = _next_token(logits, temperature, top_p, generator)
     out = [idx, token]
 
     # Decode: one token per pass. Memory-bandwidth-bound -- the model reads all
     # of its weights to produce a single token, which is why batching pays.
     for _ in range(max_new_tokens - 1):
-        logits = model(token, cache)
+        logits = model(token, cache, last_only=True)
         token = _next_token(logits, temperature, top_p, generator)
         out.append(token)
 
