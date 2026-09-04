@@ -39,6 +39,11 @@ RSH="ssh ${SSH_OPTS[*]}"
 prelude() {
   local p=""
   [[ -n "${REMOTE_INIT:-}" ]] && p+="${REMOTE_INIT} && "
+  # Shared clusters routinely run their root filesystem to 100%, which breaks pip
+  # (it unpacks into /tmp) with a confusing "No space left on device". Keep scratch
+  # and cache on the same volume as the project, which is the one with room.
+  p+="export TMPDIR=${REMOTE_DIR}/.tmp PIP_CACHE_DIR=${REMOTE_DIR}/.pipcache HF_HOME=${REMOTE_DIR}/.hf && "
+  p+="mkdir -p \$TMPDIR \$PIP_CACHE_DIR \$HF_HOME && "
   [[ -n "${CUDA_DEVICES:-}" ]] && p+="export CUDA_VISIBLE_DEVICES=${CUDA_DEVICES} && "
   printf '%s' "$p"
 }
@@ -48,7 +53,7 @@ push() {
   "${SSH[@]}" "mkdir -p ${REMOTE_DIR}"
   rsync -az --delete -e "$RSH" \
     --exclude '.git' --exclude '__pycache__' --exclude '*.pyc' \
-    --exclude '.venv' --exclude 'results/' --exclude 'scripts/remote.env' \
+    --exclude '.venv' --exclude '.tmp' --exclude '.pipcache' --exclude '.hf' --exclude 'results/' --exclude 'scripts/remote.env' \
     ./ "${TARGET}:${REMOTE_DIR}/"
 }
 
