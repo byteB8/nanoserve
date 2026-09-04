@@ -6,6 +6,9 @@
 # stays about the engine rather than about debugging cycles.
 #
 #   ./scripts/remote.sh setup                     # create remote venv, install deps
+#
+# Point at a different box with REMOTE_ENV:
+#   REMOTE_ENV=scripts/remote.bhaskar.env ./scripts/remote.sh gpus
 #   ./scripts/remote.sh push                      # sync source only
 #   ./scripts/remote.sh gpus                      # who is using the GPUs right now
 #   ./scripts/remote.sh bench all --device cuda   # sync, run, fetch results/
@@ -14,7 +17,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-ENV_FILE="scripts/remote.env"
+ENV_FILE="${REMOTE_ENV:-scripts/remote.env}"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "error: $ENV_FILE not found. Copy scripts/remote.env.example and fill it in." >&2
@@ -53,7 +56,7 @@ push() {
   "${SSH[@]}" "mkdir -p ${REMOTE_DIR}"
   rsync -az --delete -e "$RSH" \
     --exclude '.git' --exclude '__pycache__' --exclude '*.pyc' \
-    --exclude '.venv' --exclude '.tmp' --exclude '.pipcache' --exclude '.hf' --exclude 'results/' --exclude 'scripts/remote.env' \
+    --exclude '.venv' --exclude '.tmp' --exclude '.pipcache' --exclude '.hf' --exclude 'results/' --exclude 'scripts/remote*.env' \
     ./ "${TARGET}:${REMOTE_DIR}/"
 }
 
