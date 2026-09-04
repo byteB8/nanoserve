@@ -39,6 +39,7 @@ That is the textbook claim. This repo measures it, then asks the follow-up quest
 | `nanoserve/bench.py` | Benchmark harness; emits markdown straight into `RESULTS.md` |
 | `nanoserve/quant.py` | INT8 KV store, per-token symmetric scales |
 | `nanoserve/graph.py` | Bucketed CUDA graph capture of the decode step |
+| `nanoserve/scheduler.py` | Slot pool and continuous batching scheduler |
 | `nanoserve/server.py` | OpenAI-compatible HTTP endpoint with SSE streaming |
 | `tests/` | Correctness gates (see below) |
 
@@ -75,7 +76,9 @@ Three findings that a single speedup number would have hidden:
 
 **Batching is free until it isn't.** Batch 1 → 32 on the A5000 costs 10% more wall time for **29× the throughput**. On the laptop that regime ends at batch **2**. Same code, same model — the knee is a property of the hardware.
 
-**The cache is what stops you serving more.** At batch 1024 it is 19 GiB of a 20 GiB peak. A fitted memory model predicts the concurrency ceiling to within 0.25%, and predicted fp16's ceiling (2,434) landed inside the measured bracket (2,304 OK, 2,560 OOM) before it was measured.
+**The cache is what stops you serving more.** At batch 1024 it is 19 GiB of a 20 GiB peak. A fitted memory model predicts the concurrency ceiling to within 0.25%, and predicted the ceilings for fp16 (2,434) and int8 KV (3,061) *before* measuring — both landed inside their measured brackets.
+
+**Continuous batching only helps if there is a queue.** With 8 slots for 128 requests it is 1.66× the throughput and 1.8× lower mean latency. With 128 slots for the same burst nothing ever waits, and it is *slower* than lockstep batching. The work ratio — tokens computed ÷ tokens asked for — explains both ends.
 
 ## Running on a GPU
 
@@ -97,7 +100,9 @@ cp scripts/remote.env.example scripts/remote.env   # fill in host details (gitig
 - [x] CUDA graphs, bucketed by attention window — 2.3x faster decode
 - [x] INT8 KV cache — 2.5x the concurrency, exact token agreement
 - [x] Streaming OpenAI-compatible HTTP endpoint
-- [ ] Continuous batching: admit new sequences mid-flight instead of padding to the longest
+- [x] Continuous batching — 1.66x throughput and 1.8x lower mean latency under a queue
+- [ ] Wire the scheduler into the HTTP endpoint (it still serialises requests)
+- [ ] Staggered arrivals, rather than admitting a whole burst at t=0
 
 ## License
 

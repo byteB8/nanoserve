@@ -225,7 +225,40 @@ So the summary is conditional, which is the point: **int8 KV buys concurrency an
 
 *(A methodology note worth keeping: an early run of this used `--tokens 64` rather than 256, which shrank `max_seq` from 266 to 74 and let everything fit. The ceiling is a function of batch × context, not batch alone.)*
 
-## 8. Two measurement traps
+## 8. Continuous batching: it depends on there being a queue
+
+Every batch figure above was measured the easy way — N identical prompts, lockstep, wait for all. Real traffic varies in length, so a lockstep batch idles: once the shortest sequence finishes, its slot keeps stepping until the longest drains.
+
+Workload: 128 requests, 12,264 tokens asked, output lengths drawn from 16–256. A5000, fp32.
+
+| Slots | Static tok/s | Cont. tok/s | Throughput | Static work | Cont. work | Static lat mean/p95 | Cont. lat mean/p95 |
+|---|---|---|---|---|---|---|---|
+| 8 | 975 | **1,623** | **1.66×** | 2.36× | **1.05×** | 7.23 / 12.57 s | **3.92 / 6.78 s** |
+| 32 | 3,231 | **4,114** | **1.27×** | 2.67× | **1.37×** | 2.34 / 3.76 s | **1.40 / 2.43 s** |
+| 64 | 4,294 | **4,556** | 1.06× | 2.67× | 1.61× | 2.08 / 2.80 s | **1.18 / 2.17 s** |
+| 128 | **4,766** | 3,647 | **0.77×** | 2.67× | 2.55× | 2.51 / 2.51 s | **1.43** / 3.30 s |
+
+"Work" is tokens *computed* ÷ tokens *asked for* — the mechanism behind everything else.
+
+**Continuous batching wins when there is a queue, and only then.** At 8 slots for 128 requests, static computes 2.36× the tokens requested while continuous computes 1.05×, and throughput follows: 1.66×. As the pool grows the advantage decays, and at 128 slots for a 128-request burst it **reverses** — 0.77×.
+
+That reversal is not a bug. With a pool as large as the burst, every request is admitted immediately, nothing ever waits, and no slot is ever refilled. The work ratios confirm it (2.55× vs 2.67× — essentially identical), so the scheduler's machinery is pure overhead against a lockstep batch that can use the cheaper sliced-attention path. Production engines run with slots well below peak demand, which is exactly the regime where this pays.
+
+**Latency tells the other half, and it is unambiguous.** Continuous batching improves *mean* latency at every configuration — 1.67× to 1.84× — including the one where it loses on throughput. A short request no longer waits for whatever long sequence it happened to be batched with.
+
+The 128-slot row is the most interesting: static gives every request the same 2.51 s, because they all finish together. Continuous gives a mean of 1.43 s but a p95 of 3.30 s. Static batching does not make requests fast, it makes them *uniformly slow* — which flatters p95 while being worse for almost every individual caller.
+
+### Three traps between the naive scheduler and this one
+
+The first working version measured 1.47× at 8 slots and 0.52× at 128. Getting to 1.66× / 0.77× meant removing three costs, all of which had nothing to do with the model:
+
+1. **A host sync per slot per step.** Reading each slot's token back with `.item()` as it was produced meant 128 device-to-host syncs per step at 128 slots. Batching the sampler into one call and collecting each request's tokens once, at eviction, fixed it. (→ 1.61× / 0.57×)
+2. **Full-window attention** — the same trap as §6. The static decode path spans `cache.window` regardless of how far any sequence has got, so a pool reserved for 266 tokens paid full-window attention from step one. Every position is known host-side, so the window widens in buckets as sequences actually grow. (→ 1.78× / 0.75×)
+3. **Idle slots still stepping.** A slot with no live request still costs a full column of attention and MLP. Allocating from a heap keeps live requests packed into a contiguous prefix, so the step can slice to just that prefix. (→ 1.74× / 0.77×, and 64 slots crossed from 0.99× to 1.07×)
+
+Trap 3 surfaced a bug worth recording: slicing the *input* to the active prefix while leaving `pos_dev` at full width made `wpe(pos_dev)` silently broadcast the batch back up to every slot. It failed loudly here only because the shapes happened to collide; with a different slot count it would have produced plausible tokens from the wrong positions.
+
+## 9. Two measurement traps
 
 Both were caught before publishing, and both would have produced a confidently wrong claim.
 
@@ -240,7 +273,8 @@ The general lesson: when a measurement contradicts a model that has been accurat
 1. **How much further can bucketing go?** §6 leaves 2.33 ms/token at 1000 tokens against 1.41 at 128, purely from bucket coarseness. Finer buckets trade capture time and memory for it; the curve of that trade is unmeasured.
 2. **Would int8 attention kernels remove §7's latency cost?** The 1.8× slowdown is entirely dequantise-on-read. Kernels that keep the matmul in int8 should erase it and shrink the transient that ate a third of the memory saving.
 3. **Does the exponent reach 2.0 on a larger model?** The A5000 hit 1.82 at 1000 tokens with a 124M model. A model that saturates the GPU sooner should get closer.
-4. **Continuous batching.** Every batch number here pads to a fixed length and runs in lockstep. Real arrivals are staggered and finish at different times, so a slot freed early should be refilled rather than idling until the batch drains. This is also what the HTTP endpoint needs before it can serve more than one request at a time, and §3 says what it is worth: 29× the throughput at batch 32.
+4. **Staggered arrivals.** §8 admits every request at t=0, which isolates the length-variance effect but understates the case: real arrivals are spread over time, so a large pool is rarely full and admission latency matters more than it does here.
+5. **Wire the scheduler into the HTTP endpoint.** The server still serialises requests behind a semaphore; §8's scheduler is what it needs to serve concurrently.
 
 ## Reproducing
 
@@ -251,6 +285,7 @@ python -m nanoserve.bench all --device cpu --out results/laptop.md
 ./scripts/remote.sh bench graph --device cuda --repeat 8  # graphs vs eager
 ./scripts/remote.sh bench dtype --device cuda --dtypes float32 float16 bfloat16
 ./scripts/remote.sh bench kvquant --device cuda            # fp vs int8 KV
+./scripts/remote.sh bench serving --device cuda            # static vs continuous
 ```
 
 Serving:
