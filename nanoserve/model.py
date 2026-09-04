@@ -27,7 +27,9 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
 
-    def forward(self, x: torch.Tensor, cache: KVCache | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, cache: KVCache | None = None, static: bool = False
+    ) -> torch.Tensor:
         B, T, C = x.shape
         n_head, head_dim = self.cfg.n_head, self.cfg.head_dim
 
@@ -36,6 +38,15 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, n_head, head_dim).transpose(1, 2)
         k = k.view(B, T, n_head, head_dim).transpose(1, 2)
         v = v.view(B, T, n_head, head_dim).transpose(1, 2)
+
+        if static:
+            # Constant-shape decode: attend over the whole reserved window and
+            # mask, rather than slicing to the live length. Costs attention over
+            # padding, buys a kernel sequence a CUDA graph can capture.
+            k, v = cache.append_static(self.layer_idx, k, v)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=cache.valid_mask())
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+            return self.c_proj(y)
 
         if cache is None:
             # No cache: the query block is the whole sequence, so a plain causal
@@ -84,8 +95,10 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(cfg.n_embd)
         self.mlp = MLP(cfg)
 
-    def forward(self, x: torch.Tensor, cache: KVCache | None = None) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x), cache)
+    def forward(
+        self, x: torch.Tensor, cache: KVCache | None = None, static: bool = False
+    ) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x), cache, static)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -103,7 +116,11 @@ class GPT(nn.Module):
         self.lm_head.weight = self.wte.weight
 
     def forward(
-        self, idx: torch.Tensor, cache: KVCache | None = None, last_only: bool = False
+        self,
+        idx: torch.Tensor,
+        cache: KVCache | None = None,
+        last_only: bool = False,
+        static: bool = False,
     ) -> torch.Tensor:
         """Return logits for every position in `idx`, or just the last one.
 
@@ -118,6 +135,16 @@ class GPT(nn.Module):
         1024 is 2 GiB spent on values that are immediately discarded.
         """
         B, T = idx.shape
+
+        if static:
+            # Position comes from the device tensor, not a Python int, so the
+            # embedding lookup is a kernel the graph can record.
+            x = self.wte(idx) + self.wpe(cache.pos_dev).view(1, 1, self.cfg.n_embd)
+            for block in self.h:
+                x = block(x, cache, static=True)
+            cache.advance_static()
+            return self.lm_head(self.ln_f(x))
+
         past = cache.pos if cache is not None else 0
         if past + T > self.cfg.block_size:
             raise ValueError(
