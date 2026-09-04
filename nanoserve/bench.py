@@ -257,9 +257,13 @@ def run_serving(model, prompt_ids, device: str, slots_list: list[int], n_request
     rows = []
     for slots in slots_list:
         # -- static: fixed groups, everyone runs to the group's longest ------
+        # Every request in a group completes when the group does, so a short
+        # request queued behind a long one waits for the long one -- twice over:
+        # once to be admitted, once for its batch-mates to drain.
         _sync(device)
         t0 = time.perf_counter()
         computed = 0
+        static_lat = []
         for i in range(0, n_requests, slots):
             group = lengths[i : i + slots]
             n = max(group)
@@ -267,6 +271,8 @@ def run_serving(model, prompt_ids, device: str, slots_list: list[int], n_request
             cache = model.new_cache(batch_size=len(group), max_seq=prompt_len + n)
             generate_cached(model, batched, n)
             computed += len(group) * n
+            _sync(device)
+            static_lat += [time.perf_counter() - t0] * len(group)
             del cache
             if device == "cuda":
                 torch.cuda.empty_cache()
@@ -279,10 +285,15 @@ def run_serving(model, prompt_ids, device: str, slots_list: list[int], n_request
             sched.submit(Request(prompt=prompt_ids, max_tokens=n))
         _sync(device)
         t0 = time.perf_counter()
-        sched.run_to_completion()
+        done = sched.run_to_completion(clock=lambda: time.perf_counter() - t0)
         _sync(device)
         cont_s = time.perf_counter() - t0
-        cont_computed = sched.steps * slots
+        cont_computed = sum(n for n, _ in sched.history)
+        cont_lat = sorted(r.finished for r in done)
+        static_lat.sort()
+
+        def pct(xs, q):
+            return xs[min(len(xs) - 1, int(q * len(xs)))]
 
         rows.append(
             [
@@ -294,12 +305,15 @@ def run_serving(model, prompt_ids, device: str, slots_list: list[int], n_request
                 f"{asked / cont_s:.0f}",
                 f"{computed / asked:.2f}x",
                 f"{cont_computed / asked:.2f}x",
+                f"{sum(static_lat)/len(static_lat):.2f} / {pct(static_lat, 0.95):.2f}",
+                f"{sum(cont_lat)/len(cont_lat):.2f} / {pct(cont_lat, 0.95):.2f}",
             ]
         )
         print(
             f"  slots {slots:3d}: static {static_s:6.2f}s ({asked/static_s:7.0f} tok/s, "
-            f"{computed/asked:.2f}x work)   continuous {cont_s:6.2f}s "
-            f"({asked/cont_s:7.0f} tok/s, {cont_computed/asked:.2f}x work)   -> {static_s/cont_s:.2f}x"
+            f"{computed/asked:.2f}x work, lat {sum(static_lat)/len(static_lat):5.2f}/{pct(static_lat,0.95):5.2f}s)"
+            f"   cont {cont_s:6.2f}s ({asked/cont_s:7.0f} tok/s, {cont_computed/asked:.2f}x work, "
+            f"lat {sum(cont_lat)/len(cont_lat):5.2f}/{pct(cont_lat,0.95):5.2f}s)   -> {static_s/cont_s:.2f}x"
         )
         del sched
         if device == "cuda":
@@ -315,6 +329,8 @@ def run_serving(model, prompt_ids, device: str, slots_list: list[int], n_request
             "Continuous tok/s",
             "Static work",
             "Continuous work",
+            "Static lat mean/p95 (s)",
+            "Continuous lat mean/p95 (s)",
         ],
         rows,
     )
