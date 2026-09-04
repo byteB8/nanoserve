@@ -29,28 +29,28 @@ That is the textbook claim. This repo measures it, then asks the follow-up quest
 
 ## Correctness first
 
-A fast decoder that produces different tokens is not an optimisation, so the benchmarks are gated behind four tests:
+A fast decoder that produces different tokens is not an optimisation, so the benchmarks are gated behind five tests:
 
 1. Local logits match HuggingFace GPT-2 to `< 1e-3`.
 2. Cached decode matches naive decode.
 3. Feeding tokens one at a time matches a single full-sequence pass.
 4. Overflowing the reserved cache raises, rather than silently corrupting.
+5. Skipping the vocab projection on unread positions preserves the token ranking.
 
 ```
 $ pytest -q
-4 passed
+5 passed
 ```
 
 Two details cost real debugging time and are worth flagging for anyone reading the code:
 
 - **HuggingFace stores GPT-2's projections as `Conv1D`**, whose weight is the transpose of what `nn.Linear` expects. Get it wrong and the model still runs, still emits fluent-looking text, and is simply wrong. `weights.py` decides from the tensor shape rather than trusting a convention.
 - **A cached prefill needs an offset causal mask.** During decode (`q_len == 1`) no mask is needed at all, since every cached key precedes the query. But prefilling *into a non-empty cache* puts the causal boundary at an offset, where `is_causal=True` masks the wrong cells.
+- **Two benchmark traps produced confidently wrong numbers** before being caught — cache allocation inside the timed region, and allocator reservations faking an OOM at half the true capacity. Both are written up in [RESULTS.md §6](RESULTS.md).
 
 ## Results
 
-Measured numbers, the memory arithmetic, and the analysis live in **[RESULTS.md](RESULTS.md)**.
-
-Headline from a 4-core laptop CPU (Intel i5-1035G1, no GPU):
+Measured numbers, the memory arithmetic, and the analysis live in **[RESULTS.md](RESULTS.md)** — benchmarked on a 4-core laptop CPU and an RTX A5000.
 
 Cached decode holds a **flat ms/token** regardless of position in the sequence — 3.2 ms on an RTX A5000, ~20 ms on a 4-core laptop CPU. That flatness *is* the O(1)-per-step property, measured directly.
 
