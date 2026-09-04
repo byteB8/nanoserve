@@ -120,7 +120,11 @@ def run_batch(model, prompt_ids, device: str, batches: list[int], n_tokens: int,
     for b in batches:
         batched = prompt_ids.repeat(b, 1)
         try:
-            secs = _time(lambda: generate_cached(model, batched, n_tokens), device, repeat=repeat)
+            # Allocated outside the timed region, as in run_kvcache: cache setup
+            # scales with batch, so timing it here would confound the throughput
+            # curve with allocator behaviour.
+            cache = model.new_cache(batch_size=b, max_seq=prompt_ids.size(1) + n_tokens)
+            secs = _time(lambda: generate_cached(model, batched, n_tokens, cache=cache), device, repeat=repeat)
         except (torch.cuda.OutOfMemoryError if device == "cuda" else RuntimeError) as exc:
             print(f"  batch {b:4d}: out of memory -- {type(exc).__name__}")
             rows.append([str(b), "OOM", "OOM", "OOM", "-"])
