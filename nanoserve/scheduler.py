@@ -47,9 +47,16 @@ class Request:
     started: float = 0.0
     finished: float = 0.0
 
+    # Host-side bookkeeping. `n` counts tokens produced without reading the
+    # device; `start_step` marks where in the scheduler's history this request's
+    # decode tokens begin, so they can be collected in one transfer at eviction.
+    n: int = 0
+    start_step: int = 0
+    first: int = 0
+
     @property
     def done(self) -> bool:
-        return len(self.tokens) >= self.max_tokens
+        return self.n >= self.max_tokens
 
 
 class _SlotView:
@@ -158,9 +165,18 @@ class SlotCache:
 class Scheduler:
     """Keeps `n_slots` busy by admitting waiting requests as slots free."""
 
-    def __init__(self, model: GPT, n_slots: int, max_seq: int) -> None:
+    def __init__(
+        self, model: GPT, n_slots: int, max_seq: int, temperature: float = 0.0, top_p: float = 1.0
+    ) -> None:
         self.model = model
         self.n_slots = n_slots
+        # Sampling params are per-scheduler, not per-request: one sampler call
+        # covers the whole batch, and mixing temperatures would mean either a
+        # call per slot (a host sync each) or grouping requests by params, which
+        # is what production engines do.
+        self.temperature = temperature
+        self.top_p = top_p
+        self.history: list[torch.Tensor] = []
         p = next(model.parameters())
         self.cache = SlotCache(model.cfg, n_slots, max_seq, device=p.device, dtype=p.dtype)
         self.free: list[int] = list(range(n_slots))
@@ -191,7 +207,9 @@ class Scheduler:
 
             self.cache.pos_dev[slot] = view.pos
             self.last[slot] = token
-            req.tokens.append(int(token.item()))
+            req.first = int(token.item())  # one sync, at admission only
+            req.n = 1
+            req.start_step = len(self.history)
             self.active[slot] = req
             admitted += 1
         return admitted
@@ -201,6 +219,11 @@ class Scheduler:
         for slot in done:
             req = self.active.pop(slot)
             req.finished = now
+            # Collect this slot's column from the step history in a single
+            # transfer, rather than one per token as it was produced.
+            steps = self.history[req.start_step : req.start_step + req.n - 1]
+            rest = torch.cat([h[slot] for h in steps]).tolist() if steps else []
+            req.tokens = [req.first] + rest
             self.finished.append(req)
             self.cache.release(slot)
             self.free.append(slot)
@@ -223,10 +246,15 @@ class Scheduler:
             return 0
 
         logits = self.model(self.last, self.cache, static=True)
-        for slot, req in list(self.active.items()):
-            token = _next_token(logits[slot : slot + 1], req.temperature, req.top_p, None)
-            self.last[slot] = token
-            req.tokens.append(int(token.item()))
+
+        # One sampler call for the whole batch, and no `.item()` anywhere: reading
+        # a token back per slot per step means a device-to-host sync per slot per
+        # step, which at 128 slots costs far more than the decode it is reporting.
+        tokens = _next_token(logits, self.temperature, self.top_p, None)
+        self.last.copy_(tokens)
+        self.history.append(tokens)
+        for req in self.active.values():
+            req.n += 1
 
         self.steps += 1
         return len(self.active)
