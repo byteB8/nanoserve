@@ -186,7 +186,46 @@ The fix is to capture several graphs at increasing windows (128 / 256 / 512 / ma
 
 **A trap worth naming:** the obvious `step()` reads the cache position from the device to pick a bucket. That forces a device-to-host sync every token — stalling the pipeline for precisely the overhead graphs exist to remove. The position advances by exactly one per step and by nothing else, so it is tracked host-side and reconciled once per generation instead.
 
-## 7. Two measurement traps
+## 7. INT8 KV cache: concurrency bought with latency
+
+§4 established the KV-cache as the term that caps concurrency. Storing it in int8 attacks that term directly. Scheme is symmetric, per-token and per-head: each token's K (and V) vector across one head gets a scale computed when it is written and never revisited — which matches how a cache is used, since positions arrive one at a time and are then immutable.
+
+A5000, 256 tokens:
+
+| KV store | Batch | Stored | Peak VRAM | ms/token | Agreement with fp32 |
+|---|---|---|---|---|---|
+| fp32 | 1 | 19 MiB | 504 MiB | 3.24 | reference |
+| int8 | 1 | **5 MiB** | 493 MiB | 6.00 | **256/256** |
+| fp32 | 64 | 1,197 MiB | 1,709 MiB | 5.20 | — |
+| int8 | 64 | **318 MiB** | **966 MiB** | 9.44 | **256/256** |
+| fp32 | 256 | 4,788 MiB | 5,386 MiB | 17.53 | — |
+| int8 | 256 | **1,272 MiB** | **2,410 MiB** | 31.70 | **256/256** |
+
+**Accuracy is a non-issue.** Every configuration reproduced fp32's tokens exactly — identical text, no divergence anywhere. Quantisation error lands around 1/127 of each vector's own dynamic range, and the gaps between competing tokens are wider than that. This is the cheap half of the trade.
+
+**Storage falls 3.76×, but peak VRAM only 2.23×.** The difference is the honest cost of dequantise-on-read: attention still runs in floating point, so the layer being processed materialises a full fp copy of its window. The memory model quantifies it — the per-sequence term rose from **0.394 MiB (fp32) to 2.549 MiB (int8)**, and `2 × 12 layers × 266 × 64 × 4 B = 1.63 MiB` accounts for the increase. Roughly a third of the saving is handed back.
+
+**It is 1.8× slower.** Quantise on write, dequantise on read, every layer, every step — arithmetic the fp path never does. Keeping the matmul in int8 needs kernels PyTorch does not expose here; that is what production engines use int8 attention for.
+
+### The ceiling, predicted then measured
+
+Extending §4's model to int8 gives `485 + 2.549 × batch + stored(batch)`, and a predicted ceiling of **3,061 sequences**.
+
+| Batch | Predicted peak | Measured peak | Error |
+|---|---|---|---|
+| 1024 | 8,182 MiB | 8,186 MiB | 0.05% |
+| 2048 | 15,879 MiB | 15,884 MiB | 0.03% |
+| 2816 | 21,653 MiB | 21,625 MiB | 0.13% |
+| 3008 | 23,096 MiB | 23,068 MiB | 0.12% |
+| 3072 | 23,564 MiB | **OOM** | — |
+
+Measured: 3,008 runs, 3,072 does not. **The predicted 3,061 sits inside that 64-wide bracket.** Concurrency rises from ~1,205 (fp32) to ~3,061 — **2.54×**.
+
+So the summary is conditional, which is the point: **int8 KV buys concurrency and costs latency.** Right for a throughput-bound server, wrong for a latency-bound single stream. A benchmark that reported only the 3.76× storage figure would be describing a third of the picture.
+
+*(A methodology note worth keeping: an early run of this used `--tokens 64` rather than 256, which shrank `max_seq` from 266 to 74 and let everything fit. The ceiling is a function of batch × context, not batch alone.)*
+
+## 8. Two measurement traps
 
 Both were caught before publishing, and both would have produced a confidently wrong claim.
 
@@ -199,9 +238,9 @@ The general lesson: when a measurement contradicts a model that has been accurat
 ## Open questions
 
 1. **How much further can bucketing go?** §6 leaves 2.33 ms/token at 1000 tokens against 1.41 at 128, purely from bucket coarseness. Finer buckets trade capture time and memory for it; the curve of that trade is unmeasured.
-2. **Where does INT8 KV quantisation land on the accuracy axis?** §4 predicts another 2× concurrency; §5 gives the method for measuring what it costs — token agreement against an fp32 reference.
+2. **Would int8 attention kernels remove §7's latency cost?** The 1.8× slowdown is entirely dequantise-on-read. Kernels that keep the matmul in int8 should erase it and shrink the transient that ate a third of the memory saving.
 3. **Does the exponent reach 2.0 on a larger model?** The A5000 hit 1.82 at 1000 tokens with a 124M model. A model that saturates the GPU sooner should get closer.
-4. **Continuous batching.** Every batch number here pads to a fixed length. Admitting sequences mid-flight is the difference between this and a real serving engine.
+4. **Continuous batching.** Every batch number here pads to a fixed length and runs in lockstep. Real arrivals are staggered and finish at different times, so a slot freed early should be refilled rather than idling until the batch drains. This is also what the HTTP endpoint needs before it can serve more than one request at a time, and §3 says what it is worth: 29× the throughput at batch 32.
 
 ## Reproducing
 
@@ -211,4 +250,12 @@ python -m nanoserve.bench all --device cpu --out results/laptop.md
 ./scripts/remote.sh bench all --device cuda               # same code, GPU box
 ./scripts/remote.sh bench graph --device cuda --repeat 8  # graphs vs eager
 ./scripts/remote.sh bench dtype --device cuda --dtypes float32 float16 bfloat16
+./scripts/remote.sh bench kvquant --device cuda            # fp vs int8 KV
+```
+
+Serving:
+
+```bash
+uvicorn nanoserve.server:app --port 8000
+python scripts/make_demo.py                                # regenerate docs/demo.gif
 ```
