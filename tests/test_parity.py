@@ -78,3 +78,30 @@ def test_cache_overflow_is_loud(model, tokens):
     cache = model.new_cache(batch_size=1, max_seq=4)
     with torch.no_grad(), pytest.raises(RuntimeError, match="overflow"):
         model(tokens[:, :8], cache)
+
+
+def test_last_only_matches_full_projection(model, tokens):
+    """Skipping the vocab projection on discarded positions must not change output.
+
+    `last_only` exists to avoid materialising a [batch, T, 50257] tensor whose
+    non-final rows generation never reads.
+
+    Note this is *not* bit-identical, and shouldn't be asserted as such. Slicing
+    before the projection hands the GEMM a [1, 768] input instead of [10, 768],
+    which selects a different kernel with a different reduction order. Floating
+    point addition is not associative, so the results differ in the last bits --
+    measured at ~3e-5 absolute on logits of magnitude ~130, a relative error of
+    3e-7, essentially fp32 epsilon. What must hold exactly is the *decision*:
+    the ranking generation samples from.
+    """
+    with torch.no_grad():
+        full = model(tokens)
+        last = model(tokens, last_only=True)
+
+    assert last.shape[1] == 1, f"expected a single position, got {last.shape[1]}"
+
+    ref = full[:, -1]
+    diff = (last[:, 0] - ref).abs().max().item()
+    rel = diff / ref.abs().max().item()
+    assert rel < 1e-6, f"last-position logits diverge by {rel:.2e} relative -- beyond rounding"
+    assert torch.equal(last[:, 0].topk(5).indices, ref.topk(5).indices), "token ranking changed"
