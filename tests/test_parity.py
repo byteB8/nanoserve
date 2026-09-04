@@ -151,3 +151,36 @@ def test_graphed_decode_matches_cached(model, tokens):
         "graphed decode diverged at token "
         f"{int((got[0] != want[0]).nonzero()[0].item()) - prompt.size(1)}"
     )
+
+
+def test_int8_kv_preserves_generation(model, tokens):
+    """An int8 KV cache must not change what the model says.
+
+    Per-token symmetric scaling should be well within the margin that separates
+    competing tokens: quantisation error lands around 1/127 of each vector's own
+    dynamic range, while argmax gaps are typically far wider. If this ever fails,
+    the scheme is wrong -- not the tolerance.
+    """
+    from nanoserve.generate import generate_cached
+
+    n = 32
+    prompt_len = tokens.size(1)
+    fp = generate_cached(model, tokens, n, cache=model.new_cache(1, prompt_len + n))
+    q8 = generate_cached(
+        model, tokens, n, cache=model.new_cache(1, prompt_len + n, kv_dtype="int8")
+    )
+
+    same = fp[0, prompt_len:] == q8[0, prompt_len:]
+    assert bool(same.all()), (
+        f"int8 KV diverged at generated token {int((~same).nonzero()[0].item())} "
+        f"({int(same.sum())}/{n} agreed)"
+    )
+
+
+def test_int8_kv_is_smaller(model):
+    """The point of the exercise: stored bytes must actually drop."""
+    fp = model.new_cache(batch_size=4, max_seq=512)
+    q8 = model.new_cache(batch_size=4, max_seq=512, kv_dtype="int8")
+    ratio = fp.nbytes() / q8.nbytes()
+    # 4x from int8, minus one fp scale per token per head (head_dim=64) -> ~3.76x
+    assert 3.5 < ratio < 4.0, f"expected ~3.8x storage reduction, got {ratio:.2f}x"
