@@ -124,10 +124,16 @@ def run_batch(model, prompt_ids, device: str, batches: list[int], n_tokens: int,
             # scales with batch, so timing it here would confound the throughput
             # curve with allocator behaviour.
             cache = model.new_cache(batch_size=b, max_seq=prompt_ids.size(1) + n_tokens)
+            if device == "cuda":
+                torch.cuda.reset_peak_memory_stats()
             secs = _time(lambda: generate_cached(model, batched, n_tokens, cache=cache), device, repeat=repeat)
+            peak = torch.cuda.max_memory_allocated() / 2**20 if device == "cuda" else 0.0
+            # What the cache alone accounts for -- the gap against measured peak
+            # is activations, and it is not small.
+            kv_mib = cache.nbytes() / 2**20
         except (torch.cuda.OutOfMemoryError if device == "cuda" else RuntimeError) as exc:
             print(f"  batch {b:4d}: out of memory -- {type(exc).__name__}")
-            rows.append([str(b), "OOM", "OOM", "OOM", "-"])
+            rows.append([str(b), "**OOM**", "-", "-", "-", "-", "-"])
             break
         total_tps = b * n_tokens / secs
         if single is None:
@@ -139,11 +145,24 @@ def run_batch(model, prompt_ids, device: str, batches: list[int], n_tokens: int,
                 f"{total_tps:.1f}",
                 f"{n_tokens / secs:.1f}",
                 f"{total_tps / single:.1f}x",
+                f"{kv_mib:.0f}",
+                f"{peak:.0f}" if peak else "-",
             ]
         )
-        print(f"  batch {b:4d}: {secs:6.2f}s  total {total_tps:8.1f} tok/s  per-seq {n_tokens/secs:6.1f} tok/s")
+        print(
+            f"  batch {b:4d}: {secs:6.2f}s  total {total_tps:8.1f} tok/s  "
+            f"per-seq {n_tokens/secs:6.1f} tok/s  kv {kv_mib:6.0f} MiB  peak {peak:7.0f} MiB"
+        )
     return _table(
-        ["Batch", "Wall (s)", "Total tokens/s", "Per-sequence tokens/s", "Throughput vs batch 1"],
+        [
+            "Batch",
+            "Wall (s)",
+            "Total tokens/s",
+            "Per-sequence tokens/s",
+            "vs batch 1",
+            "KV-cache (MiB)",
+            "Peak VRAM (MiB)",
+        ],
         rows,
     )
 
