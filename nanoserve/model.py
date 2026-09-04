@@ -168,8 +168,19 @@ class GPT(nn.Module):
     # -- convenience ------------------------------------------------------
 
     @torch.no_grad()
-    def new_cache(self, batch_size: int, max_seq: int) -> KVCache:
+    def new_cache(self, batch_size: int, max_seq: int, kv_dtype: str = "auto"):
+        """Allocate a cache. `kv_dtype="int8"` swaps in the quantised store.
+
+        Returns a different class, not a differently-configured one -- but both
+        expose the same surface, so nothing in the forward pass branches on it.
+        """
         p = next(self.parameters())
+        if kv_dtype == "int8":
+            from .quant import QuantizedKVCache
+
+            return QuantizedKVCache(
+                self.cfg, batch_size, max_seq, device=p.device, dtype=p.dtype
+            )
         return KVCache(self.cfg, batch_size, max_seq, device=p.device, dtype=p.dtype)
 
     def n_params(self) -> int:
