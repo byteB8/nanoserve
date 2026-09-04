@@ -105,3 +105,25 @@ def test_last_only_matches_full_projection(model, tokens):
     rel = diff / ref.abs().max().item()
     assert rel < 1e-6, f"last-position logits diverge by {rel:.2e} relative -- beyond rounding"
     assert torch.equal(last[:, 0].topk(5).indices, ref.topk(5).indices), "token ranking changed"
+
+
+def test_static_path_matches_eager(model, tokens):
+    """The constant-shape decode path must agree with the sliced one.
+
+    `static=True` attends over the whole reserved window and masks, instead of
+    slicing the cache to the live length. That is a different kernel shape for
+    the same maths, so this checks the maths survived -- on CPU, where no graph
+    is involved, isolating the shape change from the capture machinery.
+    """
+    with torch.no_grad():
+        eager = model.new_cache(batch_size=1, max_seq=64)
+        model(tokens[:, :-1], eager)
+        want = model(tokens[:, -1:], eager, last_only=True)
+
+        stat = model.new_cache(batch_size=1, max_seq=64)
+        model(tokens[:, :-1], stat)          # prefill uses the ordinary path
+        got = model(tokens[:, -1:], stat, static=True)
+
+    diff = (got - want).abs().max().item()
+    assert diff < 1e-4, f"static decode diverges from eager by {diff:.2e}"
+    assert int(stat.pos_dev.item()) == stat.pos + 1, "static path did not advance the position"
