@@ -52,16 +52,15 @@ Measured numbers, the memory arithmetic, and the analysis live in **[RESULTS.md]
 
 Headline from a 4-core laptop CPU (Intel i5-1035G1, no GPU):
 
-| New tokens | Naive | +KV-cache | Speedup |
-|---|---|---|---|
-| 32 | 2.05 s | 0.64 s | 3.2× |
-| 64 | 6.19 s | 1.31 s | 4.7× |
-| 128 | 18.69 s | 2.50 s | 7.5× |
-| 256 | 57.24 s | 5.11 s | **11.2×** |
+Cached decode holds a **flat ms/token** regardless of position in the sequence — 3.2 ms on an RTX A5000, ~20 ms on a 4-core laptop CPU. That flatness *is* the O(1)-per-step property, measured directly.
 
-The speedup **grows with sequence length** — which is the real signature of the quadratic-to-linear change. A single fixed number would not tell you that.
+Three findings that a single speedup number would have hidden:
 
-And at full context with batch 8, the cache costs **576 MiB against 475 MiB of weights** — it is bigger than the model. That tension is what [RESULTS.md](RESULTS.md) is actually about.
+**The cache can lose.** At 64 tokens on the A5000 it runs at **0.8×** — slower than recomputing everything. Decode on a small model is launch-bound, not compute-bound (measured 3.2 ms/token against a 0.6 ms bandwidth floor), so naive's extra arithmetic is free on an idle GPU. The cache only pays once the quadratic term bites. This is the argument for CUDA graphs.
+
+**Batching is free until it isn't.** Batch 1 → 32 on the A5000 costs 10% more wall time for **29× the throughput**. On the laptop that regime ends at batch **2**. Same code, same model — the knee is a property of the hardware.
+
+**The cache is what stops you serving more.** At batch 1024 it is 19 GiB of a 20 GiB peak. A fitted memory model predicts the concurrency ceiling to within 0.25%, and predicted fp16's ceiling (2,434) landed inside the measured bracket (2,304 OK, 2,560 OOM) before it was measured.
 
 ## Running on a GPU
 
@@ -78,7 +77,9 @@ cp scripts/remote.env.example scripts/remote.env   # fill in host details (gitig
 - [x] GPT-2 from scratch, parity-tested against the reference
 - [x] Pre-allocated KV-cache, naive vs cached benchmark
 - [x] Batch-scaling and memory-footprint experiments
-- [ ] GPU numbers: batch saturation curve, VRAM-limited OOM boundary
+- [x] GPU numbers: batch saturation curve, VRAM-limited OOM boundary
+- [x] Precision study: fp32 / fp16 / bf16 — memory, speed, and token agreement
+- [ ] CUDA graphs to attack the launch-overhead floor
 - [ ] INT8 KV-cache quantisation — memory saved vs quality lost
 - [ ] Continuous batching: admit new sequences mid-flight instead of padding to the longest
 - [ ] Streaming HTTP endpoint
