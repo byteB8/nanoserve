@@ -56,7 +56,7 @@ Cached decode holds a **flat ms/token** regardless of position in the sequence �
 
 Three findings that a single speedup number would have hidden:
 
-**The cache can lose.** At 64 tokens on the A5000 it runs at **0.8×** — slower than recomputing everything. Decode on a small model is launch-bound, not compute-bound (measured 3.2 ms/token against a 0.6 ms bandwidth floor), so naive's extra arithmetic is free on an idle GPU. The cache only pays once the quadratic term bites. This is the argument for CUDA graphs.
+**The cache can lose — until you fix the dispatch.** At 64 tokens on the A5000 it runs at **0.8×**, slower than recomputing everything. Decode on a small model is launch-bound, not compute-bound: 3.2 ms/token against a 0.6 ms bandwidth floor. Capturing the step into a **bucketed CUDA graph** cuts it to 1.4 ms/token (**2.3×**) and the cache wins at every length again. The cache was never the problem; the dispatch around it was.
 
 **Batching is free until it isn't.** Batch 1 → 32 on the A5000 costs 10% more wall time for **29× the throughput**. On the laptop that regime ends at batch **2**. Same code, same model — the knee is a property of the hardware.
 
@@ -79,7 +79,7 @@ cp scripts/remote.env.example scripts/remote.env   # fill in host details (gitig
 - [x] Batch-scaling and memory-footprint experiments
 - [x] GPU numbers: batch saturation curve, VRAM-limited OOM boundary
 - [x] Precision study: fp32 / fp16 / bf16 — memory, speed, and token agreement
-- [ ] CUDA graphs to attack the launch-overhead floor
+- [x] CUDA graphs, bucketed by attention window — 2.3x faster decode
 - [ ] INT8 KV-cache quantisation — memory saved vs quality lost
 - [ ] Continuous batching: admit new sequences mid-flight instead of padding to the longest
 - [ ] Streaming HTTP endpoint
