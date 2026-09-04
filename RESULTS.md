@@ -153,7 +153,40 @@ But at batch, where the workload *is* bandwidth-bound, the picture inverts compl
 
 **fp16 beats bf16 for this workload.** Identical memory, but fp16 reproduced all 256 fp32 tokens exactly while bf16 diverged at token 12. bf16 spends 8 bits on mantissa to fp16's 10, trading precision for exponent range. GPT-2's inference activations do not need that range, so the extra mantissa bits win. The common "prefer bf16" guidance comes from *training*, where gradient range genuinely matters — carrying it into inference unexamined costs accuracy for nothing.
 
-## 6. Two measurement traps
+## 6. CUDA graphs: cashing in the launch overhead
+
+§1 attributed ~80% of per-token decode time to launch and dispatch rather than arithmetic. That is a falsifiable claim, and a CUDA graph tests it: capture the ~120 kernels of a decode step once, replay them with a single launch.
+
+A5000, batch 1, greedy. Short lengths at `--repeat 8`, long at `--repeat 3`:
+
+| New tokens | Eager ms/token | Graphed ms/token | Speedup |
+|---|---|---|---|
+| 64 | 3.26 | 1.43 | **2.29×** |
+| 128 | 3.24 | 1.41 | **2.31×** |
+| 256 | 3.22 | 1.51 | 2.14× |
+| 512 | 3.22 | 1.77 | 1.82× |
+| 1000 | 3.17 | 2.33 | 1.36× |
+
+**The attribution was broadly right.** Per-token cost falls from 3.2 ms to ~1.4 — from 5.3× the 0.6 ms bandwidth floor down to 2.3×. Graphs removed roughly 60% of the overhead; what remains is replay cost, sampling, the Python loop, and mask construction, none of which the graph subsumes.
+
+Note this also **flips the §1 result**: at 64 tokens the KV-cache was a net loss against naive decode. Graphed, cached decode runs at 1.43 ms/token, and the cache wins at every length again. The cache was never the problem — the dispatch around it was.
+
+### Graphs are not free: capture rigidity costs attention
+
+Capture requires constant shapes, so the static path attends over the whole reserved window rather than slicing to the live position. A run reserving 1010 slots pays full-window attention from its first token. The first implementation showed exactly that — the launch saving is constant, the wasted attention grows:
+
+| New tokens | Single full-window graph | Bucketed graphs |
+|---|---|---|
+| 128 | 2.15× | **2.31×** |
+| 256 | 1.88× | **2.14×** |
+| 512 | 1.51× | **1.82×** |
+| 1000 | 1.11× | **1.36×** |
+
+The fix is to capture several graphs at increasing windows (128 / 256 / 512 / max) and replay the smallest that covers the current position. Each stays fixed-shape — all capture requires — and choosing between them is an ordinary Python branch outside any graph. That recovered most of the loss, and the residual decline at 1000 tokens is simply bucket coarseness: finer buckets would recover more, at the cost of capture time and memory.
+
+**A trap worth naming:** the obvious `step()` reads the cache position from the device to pick a bucket. That forces a device-to-host sync every token — stalling the pipeline for precisely the overhead graphs exist to remove. The position advances by exactly one per step and by nothing else, so it is tracked host-side and reconciled once per generation instead.
+
+## 7. Two measurement traps
 
 Both were caught before publishing, and both would have produced a confidently wrong claim.
 
@@ -165,7 +198,7 @@ The general lesson: when a measurement contradicts a model that has been accurat
 
 ## Open questions
 
-1. **Do CUDA graphs close the launch-overhead gap?** §1 attributes ~80% of decode to launch overhead. Capturing the decode step should move measured ms/token toward the 0.6 ms bandwidth floor, and would make the cache win at short context too.
+1. **How much further can bucketing go?** §6 leaves 2.33 ms/token at 1000 tokens against 1.41 at 128, purely from bucket coarseness. Finer buckets trade capture time and memory for it; the curve of that trade is unmeasured.
 2. **Where does INT8 KV quantisation land on the accuracy axis?** §4 predicts another 2× concurrency; §5 gives the method for measuring what it costs — token agreement against an fp32 reference.
 3. **Does the exponent reach 2.0 on a larger model?** The A5000 hit 1.82 at 1000 tokens with a 124M model. A model that saturates the GPU sooner should get closer.
 4. **Continuous batching.** Every batch number here pads to a fixed length. Admitting sequences mid-flight is the difference between this and a real serving engine.
@@ -176,5 +209,6 @@ The general lesson: when a measurement contradicts a model that has been accurat
 pytest                                                    # correctness gates first
 python -m nanoserve.bench all --device cpu --out results/laptop.md
 ./scripts/remote.sh bench all --device cuda               # same code, GPU box
+./scripts/remote.sh bench graph --device cuda --repeat 8  # graphs vs eager
 ./scripts/remote.sh bench dtype --device cuda --dtypes float32 float16 bfloat16
 ```
