@@ -43,7 +43,7 @@ def _sync(device: str) -> None:
         torch.cuda.synchronize()
 
 
-def _time(fn, device: str, warmup: int = 1, repeat: int = 3) -> float:
+def _time(fn, device: str, warmup: int = 2, repeat: int = 3) -> float:
     """Best-of-`repeat` wall-clock seconds. Best-of, not mean: we want the machine's
     capability, not its worst scheduling luck."""
     for _ in range(warmup):
@@ -84,9 +84,19 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
 
 def run_kvcache(model, prompt_ids, device: str, lengths: list[int], repeat: int) -> str:
     rows = []
-    for n in lengths:
+    prompt_len = prompt_ids.size(1)
+    budget = model.cfg.block_size - prompt_len
+    usable = [n for n in lengths if n <= budget]
+    for n in sorted(set(lengths) - set(usable)):
+        print(f"  skipping {n}: prompt({prompt_len}) + {n} exceeds the {model.cfg.block_size}-token window")
+
+    for n in usable:
+        # Hoist cache allocation out of the timed region. Otherwise the cached
+        # path is charged a multi-MiB memset that the naive path never pays,
+        # which at short lengths is large enough to invert the comparison.
+        cache = model.new_cache(batch_size=prompt_ids.size(0), max_seq=prompt_len + n)
         naive = _time(lambda: generate_naive(model, prompt_ids, n), device, repeat=repeat)
-        cached = _time(lambda: generate_cached(model, prompt_ids, n), device, repeat=repeat)
+        cached = _time(lambda: generate_cached(model, prompt_ids, n, cache=cache), device, repeat=repeat)
         rows.append(
             [
                 str(n),
